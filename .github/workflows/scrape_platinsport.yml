@@ -1,0 +1,61 @@
+name: Scrape Platinsport Events
+
+on:
+  schedule:
+    # Esegui ogni ora (minuto 0)
+    - cron: '0 * * * *'
+  
+  # Permetti esecuzione manuale
+  workflow_dispatch:
+  
+  # Esegui anche ad ogni push (per test)
+  push:
+    branches:
+      - main
+
+jobs:
+  scrape-and-update:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install cloudscraper beautifulsoup4 lxml
+      
+      - name: Run Platinsport scraper
+        run: |
+          python scrape_platinsport.py
+      
+      - name: Check for changes
+        id: verify_diff
+        run: |
+          git diff --quiet . || echo "changed=true" >> $GITHUB_OUTPUT
+      
+      - name: Commit and push if changed
+        if: steps.verify_diff.outputs.changed == 'true'
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add *.json
+          git commit -m "🔄 Auto-update Platinsport events - $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: platinsport-events
+          path: |
+            platinsport_*.json
+          retention-days: 7
