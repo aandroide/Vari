@@ -137,12 +137,33 @@ def extract_quality(text):
         return 'SD'
     return 'Unknown'
 
-def scrape_source_list(browser):
+def scrape_source_list(browser, events=None):
     """
-    Naviga a source-list.php e estrae link Acestream
+    NUOVO APPROCCIO: Clicca sui bottoni PLAY STREAM per estrarre link Acestream
+    Se events è None, usa il metodo vecchio (source-list.php)
     """
-    stream_url = generate_stream_link()
-    print(f"[INFO] Navigazione a: {stream_url}")
+    if not events:
+        # Fallback: metodo vecchio
+        stream_url = generate_stream_link()
+        print(f"[INFO] Navigazione a: {stream_url}")
+        
+        try:
+            context = browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            )
+            page = context.new_page()
+            page.goto(stream_url, wait_until='domcontentloaded', timeout=30000)
+            time.sleep(3)
+            acestream_links = extract_acestream_links(page)
+            context.close()
+            return acestream_links
+        except Exception as e:
+            print(f"[WARN] Errore scraping source-list.php: {e}")
+            return []
+    
+    # NUOVO METODO: Clicca sui bottoni PLAY STREAM
+    print(f"[INFO] Estrazione link da bottoni PLAY STREAM (test: primi 5 eventi)...")
     
     try:
         context = browser.new_context(
@@ -151,23 +172,63 @@ def scrape_source_list(browser):
         )
         page = context.new_page()
         
-        # Naviga alla pagina stream
-        page.goto(stream_url, wait_until='domcontentloaded', timeout=30000)
+        # Naviga alla homepage
+        page.goto('https://platinsport.com/', wait_until='networkidle', timeout=60000)
+        time.sleep(2)
         
-        # Aspetta un po' per il caricamento completo
-        time.sleep(3)
+        # Chiudi cookie notice
+        try:
+            page.click('button:has-text("I ACCEPT")', timeout=3000)
+            print("[DEBUG] Cookie notice chiuso")
+        except:
+            pass
         
-        # Estrai link Acestream
-        acestream_links = extract_acestream_links(page)
+        all_links = []
+        
+        # Clicca sui primi 5 bottoni PLAY STREAM (test)
+        for idx in range(1, min(6, len(events) + 1)):
+            try:
+                print(f"[DEBUG] Click bottone PLAY STREAM #{idx}...")
+                
+                # Selettore bottone: riga idx, bottone con "PLAY STREAM"
+                button_selector = f'table tbody tr:nth-child({idx}) a:has-text("PLAY STREAM")'
+                
+                # Clicca e apri in nuova tab
+                with page.context.expect_page() as new_page_info:
+                    page.click(button_selector, timeout=5000)
+                
+                new_page = new_page_info.value
+                new_page.wait_for_load_state('domcontentloaded', timeout=15000)
+                time.sleep(2)
+                
+                # Estrai link dalla nuova pagina
+                links = extract_acestream_links(new_page)
+                all_links.extend(links)
+                print(f"[OK] Evento #{idx}: {len(links)} link trovati")
+                
+                # Chiudi tab
+                new_page.close()
+                time.sleep(1)
+                
+            except Exception as e:
+                print(f"[WARN] Errore evento #{idx}: {str(e)[:80]}")
+                continue
         
         context.close()
-        return acestream_links
         
-    except PlaywrightTimeoutError:
-        print(f"[WARN] Timeout navigazione a source-list.php")
-        return []
+        # Rimuovi duplicati
+        seen = set()
+        unique = []
+        for link in all_links:
+            if link['url'] not in seen:
+                seen.add(link['url'])
+                unique.append(link)
+        
+        print(f"[OK] Totale link unici: {len(unique)}")
+        return unique
+        
     except Exception as e:
-        print(f"[WARN] Errore scraping source-list.php: {e}")
+        print(f"[ERROR] Errore generale click bottoni: {e}")
         return []
 
 def find_pagination(soup, base_url):
@@ -390,9 +451,9 @@ def scrape_platinsport():
         
         print(f"\n[INFO] Totale eventi raccolti: {len(all_events)}")
         
-        # Scrape link Acestream
+        # Scrape link Acestream (NUOVO: click sui bottoni)
         print("\n[INFO] Tentativo estrazione link Acestream...")
-        acestream_links = scrape_source_list(browser)
+        acestream_links = scrape_source_list(browser, all_events)
         
         # Genera link stream
         stream_link = generate_stream_link()
