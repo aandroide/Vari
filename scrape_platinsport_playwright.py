@@ -205,14 +205,40 @@ def scrape_events_page(page, url):
     print(f"[INFO] Scraping: {url}")
     
     try:
-        # Naviga alla pagina
-        page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        # Naviga alla pagina e aspetta caricamento completo
+        print(f"[DEBUG] Navigazione in corso...")
+        page.goto(url, wait_until='networkidle', timeout=60000)
         
-        # Aspetta che la tabella sia visibile
-        try:
-            page.wait_for_selector('table', timeout=10000)
-        except:
-            print(f"[WARN] Tabella non trovata in {url}")
+        # Aspetta un po' per il rendering JavaScript
+        print(f"[DEBUG] Attendo rendering JavaScript...")
+        time.sleep(5)
+        
+        # Salva screenshot per debug
+        screenshot_path = 'debug_screenshot.png'
+        page.screenshot(path=screenshot_path)
+        print(f"[DEBUG] Screenshot salvato: {screenshot_path}")
+        
+        # Aspetta che la tabella sia visibile (prova più selettori)
+        table_found = False
+        selettori = ['table', 'table.events', '#events-table', '.post-listing table']
+        
+        for selettore in selettori:
+            try:
+                print(f"[DEBUG] Cerco tabella con selettore: {selettore}")
+                page.wait_for_selector(selettore, timeout=5000)
+                print(f"[OK] Tabella trovata con selettore: {selettore}")
+                table_found = True
+                break
+            except:
+                continue
+        
+        if not table_found:
+            print(f"[WARN] Tabella non trovata con nessun selettore")
+            # Salva HTML per analisi
+            html_path = 'debug_page.html'
+            with open(html_path, 'w', encoding='utf-8') as f:
+                f.write(page.content())
+            print(f"[DEBUG] HTML salvato: {html_path}")
             return [], None, []
         
         # Prendi HTML
@@ -291,20 +317,63 @@ def scrape_platinsport():
     visited_urls = set()
     
     with sync_playwright() as p:
-        # Lancia browser headless
+        # Lancia browser headless con flag anti-detection
         print("[INFO] Avvio browser Chromium...")
         browser = p.chromium.launch(
             headless=True,  # Cambia a False per debug visivo
-            args=['--no-sandbox', '--disable-setuid-sandbox']
+            args=[
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-blink-features=AutomationControlled',  # Nasconde che è automazione
+                '--disable-dev-shm-usage',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process'
+            ]
         )
         
-        # Crea context con user agent realistico
+        # Crea context con user agent realistico e stealth options
         context = browser.new_context(
             viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            locale='en-US',
+            timezone_id='Europe/Rome',
+            # Simula comportamento umano
+            geolocation={'longitude': 12.4964, 'latitude': 41.9028},  # Roma
+            permissions=['geolocation'],
+            # Headers realistici
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9,it;q=0.8',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1'
+            }
         )
         
         page = context.new_page()
+        
+        # Nasconde che il browser è controllato da Playwright
+        page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+            
+            // Override chrome object
+            window.chrome = {
+                runtime: {}
+            };
+            
+            // Override permissions
+            const originalQuery = window.navigator.permissions.query;
+            window.navigator.permissions.query = (parameters) => (
+                parameters.name === 'notifications' ?
+                    Promise.resolve({ state: Notification.permission }) :
+                    originalQuery(parameters)
+            );
+        """)
         
         # Scrape homepage
         events, date, pagination = scrape_events_page(page, url)
