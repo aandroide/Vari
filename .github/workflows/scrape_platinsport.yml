@@ -59,8 +59,11 @@ jobs:
       
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
+        if: always()  # Carica anche se lo script fallisce
         with:
           name: platinsport-events
           path: |
             platinsport_*.json
+            debug_*.png
+            debug_*.html
           retention-days: 7
