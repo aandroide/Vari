@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 Script automatico per scraping eventi live da Platinsport.com
-Bypassa CloudFlare e genera JSON compatibile con MandraKodi
+Usa Playwright per bypassare CloudFlare e estrarre link Acestream
+Compatibile con GitHub Actions
 """
 
-import cloudscraper
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
 import json
 from datetime import datetime
 import re
+import base64
+import time
 
 # Mappatura nazioni per bandiere (compatibile MandraKodi)
 LEAGUE_TO_COUNTRY = {
@@ -34,68 +37,211 @@ LEAGUE_TO_COUNTRY = {
 }
 
 def extract_country_from_league(league_text):
-    """
-    Estrae la nazione dal testo della lega
-    Es: "England - Premier League" -> "UNITED KINGDOM"
-    """
+    """Estrae la nazione dal testo della lega"""
     for key, country in LEAGUE_TO_COUNTRY.items():
         if key.lower() in league_text.lower():
             return country
     return 'INTERNATIONAL'
 
-def scrape_platinsport():
+def generate_stream_link():
+    """Genera il link con chiave base64 per source-list.php"""
+    date_str = datetime.utcnow().strftime('%Y-%m-%d')
+    key_string = date_str + "PLATINSPORT"
+    key_base64 = base64.b64encode(key_string.encode()).decode()
+    url = f"https://www.platinsport.com/link/source-list.php?key={key_base64}"
+    return url
+
+def extract_acestream_links(page):
     """
-    Scrape eventi live da Platinsport.com usando CloudScraper
+    Estrae link Acestream dalla pagina source-list.php
+    Cerca in HTML, attributi data-, onclick, e testo
     """
-    print("[INFO] Inizializzazione CloudScraper...")
-    
-    # Crea scraper con browser fingerprint
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False
-        },
-        delay=10  # Ritardo per bypassare CloudFlare
-    )
-    
-    url = "https://platinsport.com/"
-    print(f"[INFO] Richiesta a {url}")
+    print("[INFO] Estrazione link Acestream...")
+    acestream_links = []
     
     try:
-        response = scraper.get(url, timeout=30)
+        # Aspetta che la pagina sia caricata
+        page.wait_for_load_state('networkidle', timeout=10000)
         
-        if response.status_code != 200:
-            print(f"[ERRORE] Status code: {response.status_code}")
-            return None
+        # Prendi l'HTML
+        content = page.content()
+        soup = BeautifulSoup(content, 'html.parser')
         
-        print(f"[OK] Pagina scaricata ({len(response.content)} bytes)")
+        # Pattern 1: Link <a href="acestream://...">
+        for link in soup.find_all('a', href=True):
+            href = link['href']
+            if 'acestream://' in href:
+                acestream_links.append({
+                    'url': href.strip(),
+                    'text': link.get_text(strip=True) or 'Stream Link',
+                    'quality': extract_quality(link.get_text(strip=True))
+                })
         
-        # Parsing HTML
-        soup = BeautifulSoup(response.content, 'html.parser')
+        # Pattern 2: Attributi data-*
+        for elem in soup.find_all(attrs={'data-stream': True}):
+            stream = elem['data-stream']
+            if 'acestream://' in stream:
+                acestream_links.append({
+                    'url': stream.strip(),
+                    'text': elem.get_text(strip=True) or 'Stream Link',
+                    'quality': extract_quality(elem.get_text(strip=True))
+                })
+        
+        # Pattern 3: Cerca nel testo con regex
+        acestream_pattern = r'acestream://[a-f0-9]{40}'
+        matches = re.findall(acestream_pattern, content, re.IGNORECASE)
+        for match in matches:
+            # Evita duplicati
+            if not any(link['url'] == match for link in acestream_links):
+                acestream_links.append({
+                    'url': match.strip(),
+                    'text': 'Extracted from page',
+                    'quality': 'Unknown'
+                })
+        
+        # Pattern 4: Cerca in onclick events
+        for elem in soup.find_all(onclick=True):
+            onclick = elem['onclick']
+            matches = re.findall(acestream_pattern, onclick, re.IGNORECASE)
+            for match in matches:
+                if not any(link['url'] == match for link in acestream_links):
+                    acestream_links.append({
+                        'url': match.strip(),
+                        'text': elem.get_text(strip=True) or 'From onclick',
+                        'quality': extract_quality(elem.get_text(strip=True))
+                    })
+        
+        # Rimuovi duplicati
+        seen = set()
+        unique_links = []
+        for link in acestream_links:
+            if link['url'] not in seen:
+                seen.add(link['url'])
+                unique_links.append(link)
+        
+        print(f"[OK] Trovati {len(unique_links)} link Acestream unici")
+        return unique_links
+        
+    except Exception as e:
+        print(f"[WARN] Errore estrazione Acestream: {e}")
+        return []
+
+def extract_quality(text):
+    """Estrae qualità video dal testo (HD, FHD, SD, etc.)"""
+    text_upper = text.upper()
+    if 'FHD' in text_upper or '1080' in text_upper:
+        return 'FHD'
+    elif 'HD' in text_upper or '720' in text_upper:
+        return 'HD'
+    elif 'SD' in text_upper or '480' in text_upper:
+        return 'SD'
+    return 'Unknown'
+
+def scrape_source_list(browser):
+    """
+    Naviga a source-list.php e estrae link Acestream
+    """
+    stream_url = generate_stream_link()
+    print(f"[INFO] Navigazione a: {stream_url}")
+    
+    try:
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        page = context.new_page()
+        
+        # Naviga alla pagina stream
+        page.goto(stream_url, wait_until='domcontentloaded', timeout=30000)
+        
+        # Aspetta un po' per il caricamento completo
+        time.sleep(3)
+        
+        # Estrai link Acestream
+        acestream_links = extract_acestream_links(page)
+        
+        context.close()
+        return acestream_links
+        
+    except PlaywrightTimeoutError:
+        print(f"[WARN] Timeout navigazione a source-list.php")
+        return []
+    except Exception as e:
+        print(f"[WARN] Errore scraping source-list.php: {e}")
+        return []
+
+def find_pagination(soup, base_url):
+    """Cerca link di paginazione"""
+    pagination_urls = []
+    
+    patterns = [
+        (r'/page/(\d+)', 'href'),
+        (r'\?page=(\d+)', 'href'),
+        (r'page-(\d+)', 'href')
+    ]
+    
+    for link in soup.find_all('a', href=True):
+        href = link['href']
+        text = link.get_text(strip=True).lower()
+        
+        # Check pattern numerici
+        for pattern, _ in patterns:
+            if re.search(pattern, href):
+                full_url = base_url + href if href.startswith('/') else href
+                if full_url not in pagination_urls:
+                    pagination_urls.append(full_url)
+        
+        # Check testo
+        if any(word in text for word in ['next', 'successivo', '»', '>']):
+            if href and href not in ['#', 'javascript:void(0)']:
+                full_url = base_url + href if href.startswith('/') else href
+                if full_url not in pagination_urls and full_url != base_url:
+                    pagination_urls.append(full_url)
+    
+    return pagination_urls
+
+def scrape_events_page(page, url):
+    """Estrae eventi da una singola pagina"""
+    print(f"[INFO] Scraping: {url}")
+    
+    try:
+        # Naviga alla pagina
+        page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        
+        # Aspetta che la tabella sia visibile
+        try:
+            page.wait_for_selector('table', timeout=10000)
+        except:
+            print(f"[WARN] Tabella non trovata in {url}")
+            return [], None, []
+        
+        # Prendi HTML
+        content = page.content()
+        soup = BeautifulSoup(content, 'html.parser')
         
         # Estrai data
         date_div = soup.find('div', class_='div-1')
-        event_date = date_div.get_text(strip=True) if date_div else "Unknown Date"
-        print(f"[INFO] Data eventi: {event_date}")
+        event_date = date_div.get_text(strip=True) if date_div else None
         
+        # Cerca paginazione
+        pagination = find_pagination(soup, url.rsplit('/', 1)[0] if '/' in url else url)
+        
+        # Estrai eventi
         eventi = []
         current_league = ""
         current_country = ""
         
-        # Trova tutte le righe della tabella
         table = soup.find('table')
         if not table:
-            print("[ERRORE] Tabella eventi non trovata!")
-            return None
+            return eventi, event_date, pagination
         
         for row in table.find_all('tr'):
-            # Riga intestazione lega
+            # Intestazione lega
             league_header = row.find('td', class_='stil')
             if league_header:
                 current_league = league_header.get_text(strip=True)
                 current_country = extract_country_from_league(current_league)
-                print(f"[LEGA] {current_league} -> {current_country}")
+                print(f"  [LEGA] {current_league} -> {current_country}")
                 continue
             
             # Riga evento
@@ -106,8 +252,7 @@ def scrape_platinsport():
                     match_text = cells[1].get_text(strip=True)
                     datetime_utc = time_elem['datetime']
                     
-                    # Crea ID univoco
-                    event_id = f"platin_{datetime_utc}_{match_text}".replace(' ', '_').replace(':', '')
+                    event_id = f"platin_{datetime_utc}_{match_text}".replace(' ', '_').replace(':', '').replace('/', '_')
                     
                     evento = {
                         'id': event_id,
@@ -116,29 +261,103 @@ def scrape_platinsport():
                         'country': current_country,
                         'datetime': datetime_utc,
                         'source': 'platinsport',
-                        'url': url,
-                        'thumbnail': 'https://www.platinsport.com/resim/Logo.webp'
+                        'url': url
                     }
                     eventi.append(evento)
         
-        print(f"[OK] Estratti {len(eventi)} eventi")
-        return {
-            'date': event_date,
-            'events': eventi,
-            'last_update': datetime.utcnow().isoformat() + 'Z',
-            'source': 'platinsport.com'
-        }
+        print(f"  [OK] Estratti {len(eventi)} eventi")
+        return eventi, event_date, pagination
         
+    except PlaywrightTimeoutError:
+        print(f"[ERRORE] Timeout caricamento {url}")
+        return [], None, []
     except Exception as e:
-        print(f"[ERRORE] Eccezione durante scraping: {e}")
+        print(f"[ERRORE] Eccezione scraping {url}: {e}")
         import traceback
         traceback.print_exc()
-        return None
+        return [], None, []
+
+def scrape_platinsport():
+    """
+    Funzione principale - Scraping con Playwright
+    """
+    print("=" * 60)
+    print("PLATINSPORT SCRAPER - PLAYWRIGHT")
+    print("=" * 60)
+    
+    url = "https://platinsport.com/"
+    all_events = []
+    event_date = None
+    visited_urls = set()
+    
+    with sync_playwright() as p:
+        # Lancia browser headless
+        print("[INFO] Avvio browser Chromium...")
+        browser = p.chromium.launch(
+            headless=True,  # Cambia a False per debug visivo
+            args=['--no-sandbox', '--disable-setuid-sandbox']
+        )
+        
+        # Crea context con user agent realistico
+        context = browser.new_context(
+            viewport={'width': 1920, 'height': 1080},
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        )
+        
+        page = context.new_page()
+        
+        # Scrape homepage
+        events, date, pagination = scrape_events_page(page, url)
+        all_events.extend(events)
+        event_date = date or event_date
+        visited_urls.add(url)
+        
+        # Scrape pagine aggiuntive (max 3)
+        for page_url in pagination[:3]:
+            if page_url not in visited_urls:
+                visited_urls.add(page_url)
+                events, _, _ = scrape_events_page(page, page_url)
+                all_events.extend(events)
+        
+        print(f"\n[INFO] Totale eventi raccolti: {len(all_events)}")
+        
+        # Scrape link Acestream
+        print("\n[INFO] Tentativo estrazione link Acestream...")
+        acestream_links = scrape_source_list(browser)
+        
+        # Genera link stream
+        stream_link = generate_stream_link()
+        
+        # Aggiungi link a tutti gli eventi
+        for event in all_events:
+            event['stream_link'] = stream_link
+            event['acestream_links'] = acestream_links
+            event['thumbnail'] = 'https://www.platinsport.com/resim/Logo.webp'
+        
+        # Chiudi browser
+        browser.close()
+    
+    print("\n" + "=" * 60)
+    print("RISULTATI:")
+    print(f"  - Eventi totali: {len(all_events)}")
+    print(f"  - Pagine visitate: {len(visited_urls)}")
+    print(f"  - Link Acestream trovati: {len(acestream_links)}")
+    print(f"  - Link stream: {stream_link}")
+    print("=" * 60)
+    
+    return {
+        'date': event_date,
+        'events': all_events,
+        'pagination_links': list(visited_urls),
+        'stream_link': stream_link,
+        'acestream_links': acestream_links,
+        'acestream_found': len(acestream_links),
+        'last_update': datetime.utcnow().isoformat() + 'Z',
+        'source': 'platinsport.com'
+    }
 
 def organize_by_country(data):
-    """
-    Organizza eventi per nazione (formato MandraKodi cartelle)
-    """
+    """Organizza eventi per nazione (formato MandraKodi cartelle)"""
     if not data or not data.get('events'):
         return {}
     
@@ -152,9 +371,7 @@ def organize_by_country(data):
     return countries
 
 def save_json(data, filename):
-    """
-    Salva dati in formato JSON
-    """
+    """Salva dati in formato JSON"""
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -165,24 +382,22 @@ def save_json(data, filename):
         return False
 
 def main():
-    """
-    Funzione principale
-    """
-    print("=" * 60)
-    print("PLATINSPORT SCRAPER - GitHub Actions")
-    print("=" * 60)
+    """Funzione principale"""
+    print("\n" + "=" * 60)
+    print("PLATINSPORT SCRAPER - PLAYWRIGHT + GITHUB ACTIONS")
+    print("=" * 60 + "\n")
     
     # Scrape dati
     data = scrape_platinsport()
     
-    if not data:
-        print("[ERRORE] Scraping fallito!")
+    if not data or not data.get('events'):
+        print("\n[ERRORE] Nessun evento estratto!")
         return 1
     
     # Salva JSON principale
     save_json(data, 'platinsport_events.json')
     
-    # Organizza per nazione (compatibile MandraKodi)
+    # Organizza per nazione
     countries = organize_by_country(data)
     
     # Salva JSON per nazione
@@ -192,18 +407,23 @@ def main():
             'country': country,
             'events': events,
             'count': len(events),
+            'stream_link': data['stream_link'],
+            'acestream_links': data['acestream_links'],
             'last_update': data['last_update']
         }
         save_json(country_data, f'platinsport_{country_safe}.json')
     
-    # Statistiche
+    # Statistiche finali
     print("\n" + "=" * 60)
-    print("STATISTICHE:")
-    print(f"  - Totale eventi: {len(data['events'])}")
-    print(f"  - Nazioni: {len(countries)}")
+    print("STATISTICHE FINALI:")
+    print(f"  ✅ Eventi totali: {len(data['events'])}")
+    print(f"  ✅ Nazioni: {len(countries)}")
+    print(f"  ✅ Link Acestream: {data['acestream_found']}")
+    print(f"  ✅ Pagine scrapate: {len(data.get('pagination_links', []))}")
+    print()
     for country, events in sorted(countries.items()):
         print(f"    • {country}: {len(events)} eventi")
-    print("=" * 60)
+    print("=" * 60 + "\n")
     
     return 0
 
